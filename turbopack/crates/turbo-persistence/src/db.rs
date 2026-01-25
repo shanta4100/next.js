@@ -20,7 +20,7 @@ use smallvec::SmallVec;
 
 pub use crate::compaction::selector::CompactConfig;
 use crate::{
-    QueryKey,
+    DbConfig, DeduplicationMode, QueryKey,
     arc_slice::ArcSlice,
     compaction::selector::{Compactable, get_merge_segments},
     compression::decompress_into_arc,
@@ -121,6 +121,8 @@ pub struct TurboPersistence<S: ParallelScheduler, const FAMILIES: usize> {
     key_block_cache: BlockCache,
     /// A cache for decompressed value blocks.
     value_block_cache: BlockCache,
+    /// Per-family configuration for file limits.
+    config: DbConfig<FAMILIES>,
     /// Statistics for the database.
     #[cfg(feature = "stats")]
     stats: TrackedStats,
@@ -157,6 +159,11 @@ impl<S: ParallelScheduler + Default, const FAMILIES: usize> TurboPersistence<S, 
         Self::open_with_parallel_scheduler(path, Default::default())
     }
 
+    /// Open a TurboPersistence database at the given path with custom per-family configuration.
+    pub fn open_with_config(path: PathBuf, config: DbConfig<FAMILIES>) -> Result<Self> {
+        Self::open_with_config_and_parallel_scheduler(path, config, Default::default())
+    }
+
     /// Open a TurboPersistence database at the given path in read only mode.
     /// This will read the directory. No Cleanup is performed.
     pub fn open_read_only(path: PathBuf) -> Result<Self> {
@@ -165,7 +172,12 @@ impl<S: ParallelScheduler + Default, const FAMILIES: usize> TurboPersistence<S, 
 }
 
 impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> {
-    fn new(path: PathBuf, read_only: bool, parallel_scheduler: S) -> Self {
+    fn new(
+        path: PathBuf,
+        read_only: bool,
+        parallel_scheduler: S,
+        config: DbConfig<FAMILIES>,
+    ) -> Self {
         Self {
             parallel_scheduler,
             path,
@@ -191,6 +203,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                 Default::default(),
                 Default::default(),
             ),
+            config,
             #[cfg(feature = "stats")]
             stats: TrackedStats::default(),
         }
@@ -201,7 +214,16 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
     /// properly. Cleanup only requires to read a few bytes from a few files and to delete
     /// files, so it's fast.
     pub fn open_with_parallel_scheduler(path: PathBuf, parallel_scheduler: S) -> Result<Self> {
-        let mut db = Self::new(path, false, parallel_scheduler);
+        Self::open_with_config_and_parallel_scheduler(path, DbConfig::default(), parallel_scheduler)
+    }
+
+    /// Open a TurboPersistence database at the given path with custom per-family configuration.
+    pub fn open_with_config_and_parallel_scheduler(
+        path: PathBuf,
+        config: DbConfig<FAMILIES>,
+        parallel_scheduler: S,
+    ) -> Result<Self> {
+        let mut db = Self::new(path, false, parallel_scheduler, config);
         db.open_directory(false)?;
         Ok(db)
     }
@@ -212,7 +234,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
         path: PathBuf,
         parallel_scheduler: S,
     ) -> Result<Self> {
-        let mut db = Self::new(path, true, parallel_scheduler);
+        let mut db = Self::new(path, true, parallel_scheduler, DbConfig::default());
         db.open_directory(false)?;
         Ok(db)
     }
@@ -422,6 +444,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
             self.path.clone(),
             current,
             self.parallel_scheduler.clone(),
+            self.config.family_configs,
         ))
     }
 
@@ -1058,12 +1081,23 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                                 }
                                 let mut used_collector = Collector::default();
                                 let mut unused_collector = Collector::default();
+                                let family_config = &self.config.family_configs[family as usize];
+
                                 for entry in iter {
                                     let entry = entry?;
 
-                                    // Remove duplicates
+                                    // Remove duplicates based on family's deduplication mode
                                     if let Some(current) = current.take() {
-                                        if current.key != entry.key {
+                                        let is_duplicate = match family_config.deduplication_mode {
+                                            DeduplicationMode::ByKeyOnly => {
+                                                current.key == entry.key
+                                            }
+                                            DeduplicationMode::ByKeyAndValue => {
+                                                current.key == entry.key
+                                                    && current.value.eq_for_dedup(&entry.value)
+                                            }
+                                        };
+                                        if !is_duplicate {
                                             let is_used =
                                                 used_key_hashes[family as usize].iter().any(
                                                     |amqf| amqf.contains_fingerprint(current.hash),
@@ -1354,8 +1388,69 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
             result_size = tracing::field::Empty
         )
         .entered();
+        let results = self.get_impl(family, key, false)?;
+        debug_assert!(results.len() <= 1, "get() should return at most one result");
+        match results.into_iter().next() {
+            Some(value) => {
+                span.record("result_size", value.len());
+                Ok(Some(value))
+            }
+            None => {
+                span.record("result_size", "not found");
+                Ok(None)
+            }
+        }
+    }
+
+    /// Looks up a key and returns all matching values.
+    ///
+    /// This is useful for keyspaces where keys are not unique and collisions are possible.
+    /// Unlike `get`, which returns only the first match, this method returns all
+    /// entries with the same key from all SST files.  By default however we assume these collisions
+    /// are extremely rare and thus optimize for there being exactly 0 or 1 results.
+    ///
+    /// Note: This method does NOT deduplicate values. If the same key-value pair exists
+    /// in multiple SST files (e.g., before compaction), it will be returned multiple times.
+    pub fn get_multiple<K: QueryKey>(
+        &self,
+        family: usize,
+        key: &K,
+    ) -> Result<SmallVec<[ArcSlice<u8>; 1]>> {
+        debug_assert!(family < FAMILIES, "Family index out of bounds");
+        let span = tracing::trace_span!(
+            "database read multiple",
+            name = family,
+            result_count = tracing::field::Empty,
+            result_size = tracing::field::Empty
+        )
+        .entered();
+        let results = self.get_impl(family, key, true)?;
+        span.record("result_count", results.len());
+        span.record(
+            "result_size",
+            results.iter().map(|r| r.len()).sum::<usize>(),
+        );
+        Ok(results)
+    }
+
+    /// Shared implementation for `get` and `get_multiple`.
+    ///
+    /// If `find_all` is false, stops after finding the first match.
+    /// If `find_all` is true, continues to find all matches across all meta files.
+    fn get_impl<K: QueryKey>(
+        &self,
+        family: usize,
+        key: &K,
+        find_all: bool,
+    ) -> Result<SmallVec<[ArcSlice<u8>; 1]>> {
         let hash = hash_key(key);
         let inner = self.inner.read();
+        let mut output: SmallVec<[ArcSlice<u8>; 1]> = SmallVec::new();
+        // Track whether we found the key in any SST (even if deleted).
+        // Used for miss_global stat: only fires if key was never found anywhere.
+        #[cfg(feature = "stats")]
+        let mut found_in_sst = false;
+
         for meta in inner.meta_files.iter().rev() {
             match meta.lookup(
                 family as u32,
@@ -1363,6 +1458,7 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                 key,
                 &self.key_block_cache,
                 &self.value_block_cache,
+                find_all,
             )? {
                 MetaLookupResult::FamilyMiss => {
                     #[cfg(feature = "stats")]
@@ -1377,28 +1473,39 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                     self.stats.miss_amqf.fetch_add(1, Ordering::Relaxed);
                 }
                 MetaLookupResult::SstLookup(result) => match result {
-                    SstLookupResult::Found(result) => {
+                    SstLookupResult::Found(values) => {
+                        #[cfg(feature = "stats")]
+                        {
+                            found_in_sst = true;
+                        }
                         inner.accessed_key_hashes[family].insert(hash);
-                        match result {
-                            LookupValue::Deleted => {
-                                #[cfg(feature = "stats")]
-                                self.stats.hits_deleted.fetch_add(1, Ordering::Relaxed);
-                                span.record("result_size", "deleted");
-                                return Ok(None);
+                        for value in values {
+                            match value {
+                                LookupValue::Deleted => {
+                                    #[cfg(feature = "stats")]
+                                    self.stats.hits_deleted.fetch_add(1, Ordering::Relaxed);
+                                    if !find_all {
+                                        // For get, deleted means "key was deleted", stop looking
+                                        return Ok(SmallVec::new());
+                                    }
+                                    // For get_multiple, skip deleted entries but keep looking
+                                }
+                                LookupValue::Slice { value } => {
+                                    #[cfg(feature = "stats")]
+                                    self.stats.hits_small.fetch_add(1, Ordering::Relaxed);
+                                    output.push(value);
+                                }
+                                LookupValue::Blob { sequence_number } => {
+                                    #[cfg(feature = "stats")]
+                                    self.stats.hits_blob.fetch_add(1, Ordering::Relaxed);
+                                    let blob = self.read_blob(sequence_number)?;
+                                    output.push(blob);
+                                }
                             }
-                            LookupValue::Slice { value } => {
-                                #[cfg(feature = "stats")]
-                                self.stats.hits_small.fetch_add(1, Ordering::Relaxed);
-                                span.record("result_size", value.len());
-                                return Ok(Some(value));
-                            }
-                            LookupValue::Blob { sequence_number } => {
-                                #[cfg(feature = "stats")]
-                                self.stats.hits_blob.fetch_add(1, Ordering::Relaxed);
-                                let blob = self.read_blob(sequence_number)?;
-                                span.record("result_size", blob.len());
-                                return Ok(Some(blob));
-                            }
+                        }
+                        if !find_all {
+                            // For get, we found a non-deleted value, return it
+                            return Ok(output);
                         }
                     }
                     SstLookupResult::NotFound => {
@@ -1408,10 +1515,13 @@ impl<S: ParallelScheduler, const FAMILIES: usize> TurboPersistence<S, FAMILIES> 
                 },
             }
         }
+
         #[cfg(feature = "stats")]
-        self.stats.miss_global.fetch_add(1, Ordering::Relaxed);
-        span.record("result_size", "not found");
-        Ok(None)
+        if !found_in_sst {
+            self.stats.miss_global.fetch_add(1, Ordering::Relaxed);
+        }
+
+        Ok(output)
     }
 
     pub fn batch_get<K: QueryKey>(

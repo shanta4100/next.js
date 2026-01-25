@@ -8,13 +8,15 @@ use std::{
 
 use anyhow::{Ok, Result};
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use turbo_persistence::{
-    ArcSlice, CompactConfig, KeyBase, StoreKey, TurboPersistence, ValueBuffer,
+    ArcSlice, CompactConfig, DbConfig, DeduplicationMode, FamilyConfig, KeyBase, StoreKey,
+    TurboPersistence, ValueBuffer,
 };
 use turbo_tasks::{JoinHandle, message_queue::TimingEvent, spawn, turbo_tasks};
 
 use crate::database::{
-    key_value_database::{KeySpace, KeyValueDatabase},
+    key_value_database::{KeySpace, KeyValueDatabase, LookupSemantics},
     turbo::parallel_scheduler::TurboTasksParallelScheduler,
     write_batch::{BaseWriteBatch, ConcurrentWriteBatch, WriteBatch, WriteBuffer},
 };
@@ -43,9 +45,50 @@ pub struct TurboKeyValueDatabase {
     is_fresh: bool,
 }
 
+impl KeySpace {
+    /// Returns the persistence configuration for this keyspace.
+    ///
+    /// Configuration rationale:
+    /// - `max_entries_per_initial_file`: Controls SST file splitting during writes. Smaller values
+    ///   create more files but reduce memory usage.
+    /// - `data_threshold_per_initial_file`: Memory budget for initial file writes.
+    fn family_config(&self) -> FamilyConfig {
+        match self {
+            // Infra has only 2 keys ever, so use minimal limits
+            KeySpace::Infra => FamilyConfig {
+                max_entries_per_initial_file: 16,
+                ..Default::default()
+            },
+            // TaskMeta and TaskData use default limits
+            KeySpace::TaskMeta | KeySpace::TaskData => FamilyConfig::default(),
+            // TaskCache uses hash-based lookups with potential collisions.
+            // Maximize entries per file to minimize files scanned in get_multiple.
+            // Use usize::MAX to effectively disable entry limit; data threshold controls file size.
+            KeySpace::TaskCache => FamilyConfig {
+                // The keys and values in this keyspace are very small, so we just target the same
+                // file size as compaction
+                max_entries_per_initial_file: 1024 * 1024,
+                data_threshold_per_initial_file: 256 * 1024 * 1024,
+                // We need to gracefully handle hash collisions, so only deduplicate if both key and
+                // value are identical
+                deduplication_mode: DeduplicationMode::ByKeyAndValue,
+                ..Default::default()
+            },
+        }
+    }
+}
+
 impl TurboKeyValueDatabase {
     pub fn new(versioned_path: PathBuf, is_ci: bool, is_short_session: bool) -> Result<Self> {
-        let db = Arc::new(TurboPersistence::open(versioned_path)?);
+        let config = DbConfig {
+            family_configs: [
+                KeySpace::Infra.family_config(),
+                KeySpace::TaskMeta.family_config(),
+                KeySpace::TaskData.family_config(),
+                KeySpace::TaskCache.family_config(),
+            ],
+        };
+        let db = Arc::new(TurboPersistence::open_with_config(versioned_path, config)?);
         Ok(Self {
             db: db.clone(),
             compact_join_handle: Mutex::new(None),
@@ -81,6 +124,11 @@ impl KeyValueDatabase for TurboKeyValueDatabase {
         key_space: KeySpace,
         key: &[u8],
     ) -> Result<Option<Self::ValueBuffer<'l>>> {
+        debug_assert!(
+            key_space.lookup_semantics() != LookupSemantics::MultipleValues,
+            "KeySpace {:?} may have multiple values - use get_multiple instead",
+            key_space
+        );
         self.db.get(key_space as usize, &key)
     }
 
@@ -91,6 +139,20 @@ impl KeyValueDatabase for TurboKeyValueDatabase {
         keys: &[&[u8]],
     ) -> Result<Vec<Option<Self::ValueBuffer<'l>>>> {
         self.db.batch_get(key_space as usize, keys)
+    }
+
+    fn get_multiple<'l, 'db: 'l>(
+        &'l self,
+        _transaction: &'l Self::ReadTransaction<'db>,
+        key_space: KeySpace,
+        key: &[u8],
+    ) -> Result<SmallVec<[Self::ValueBuffer<'l>; 1]>> {
+        debug_assert!(
+            key_space.lookup_semantics() != LookupSemantics::SingleValue,
+            "KeySpace {:?} has single values - use get instead of get_multiple",
+            key_space
+        );
+        self.db.get_multiple(key_space as usize, &key)
     }
 
     type ConcurrentWriteBatch<'l>
