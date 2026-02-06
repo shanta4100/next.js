@@ -322,6 +322,7 @@
       "@types/react": "19.2.10",
       "@types/react-dom": "19.2.3",
       "@types/retry": "0.12.0",
+      "@types/estree": "1.0.8",
       "jest-snapshot": "30.0.0-alpha.6",
       "react": "19.3.0-canary-95ffd6cd-20260205",
       "react-dom": "19.3.0-canary-95ffd6cd-20260205",
