@@ -11,14 +11,16 @@ import { publicAppRouterInstance } from './app-router-instance'
 const isBotUserAgent =
   typeof window !== 'undefined' && isBot(window.navigator.userAgent)
 
-export type ErrorComponent = React.ComponentType<{
+export type ErrorInfo = {
   error: Error
   reset: () => void
   retry: () => void
   componentStack: React.ErrorInfo['componentStack']
   /** DEV-only */
   ownerStack: ReturnType<typeof React.captureOwnerStack>
-}>
+}
+
+export type ErrorComponent = React.ComponentType<ErrorInfo>
 
 export interface ErrorBoundaryProps {
   children?: React.ReactNode
